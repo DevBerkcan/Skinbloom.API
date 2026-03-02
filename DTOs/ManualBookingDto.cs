@@ -29,3 +29,10 @@ public record CustomerBasicDto(
     string? Email,
     Guid? EmployeeId
 );
+
+public record EmailConflictCheckDto
+{
+    public bool HasConflict { get; set; }
+    public string? ExistingName { get; set; }
+    public string? ExistingEmail { get; set; }
+}

@@ -150,6 +150,42 @@ public class ManualBookingService
         );
     }
 
+    // In ManualBookingService.cs
+    public async Task<EmailConflictCheckDto> CheckEmailConflictAsync(string email, string firstName, string lastName, Guid? employeeId)
+    {
+        if (string.IsNullOrWhiteSpace(email) || !employeeId.HasValue)
+        {
+            return new EmailConflictCheckDto { HasConflict = false };
+        }
+
+        var existingCustomer = await _context.Customers
+            .FirstOrDefaultAsync(c => c.Email != null && c.Email.ToLower() == email.ToLower()
+                && c.EmployeeId == employeeId.Value);
+
+        if (existingCustomer == null)
+        {
+            return new EmailConflictCheckDto { HasConflict = false };
+        }
+
+        // Check if names match
+        string existingFullName = $"{existingCustomer.FirstName} {existingCustomer.LastName}".Trim();
+        string newFullName = $"{firstName} {lastName}".Trim();
+
+        bool namesMatch = string.Equals(existingFullName, newFullName, StringComparison.OrdinalIgnoreCase);
+
+        if (!namesMatch)
+        {
+            return new EmailConflictCheckDto
+            {
+                HasConflict = true,
+                ExistingName = existingFullName,
+                ExistingEmail = existingCustomer.Email
+            };
+        }
+
+        return new EmailConflictCheckDto { HasConflict = false };
+    }
+
     public async Task<ManualBookingResponseDto?> GetManualBookingByIdAsync(Guid id)
     {
         var booking = await _context.Bookings

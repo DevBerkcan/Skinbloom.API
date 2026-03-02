@@ -111,6 +111,35 @@ public class AdminController : ControllerBase
         }
     }
 
+    // In AdminController.cs
+    [HttpGet("manual/booking/check-email")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public async Task<ActionResult<EmailConflictCheckDto>> CheckEmailConflict(
+        [FromQuery] string email,
+        [FromQuery] string firstName,
+        [FromQuery] string lastName)
+    {
+        try
+        {
+            var employeeId = GetCurrentEmployeeId();
+            var result = await _manualBookingService.CheckEmailConflictAsync(email, firstName, lastName, employeeId);
+            return Ok(result);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error checking email conflict");
+            return StatusCode(500, new { message = "Fehler beim Prüfen der E-Mail" });
+        }
+    }
+
+    // Add this DTO
+    public class EmailConflictCheckDto
+    {
+        public bool HasConflict { get; set; }
+        public string? ExistingName { get; set; }
+        public string? ExistingEmail { get; set; }
+    }
+
     /// <summary>
     /// Create a manual booking for a customer (e.g., phone call)
     /// </summary>
