@@ -509,20 +509,72 @@ public class ServiceService
     {
         var service = await _context.Services
             .Include(s => s.Bookings)
+            .Include(s => s.ServiceEmployees)
             .FirstOrDefaultAsync(s => s.Id == id);
 
         if (service == null)
             throw new ArgumentException("Service nicht gefunden");
 
-        // Check if service has any bookings
-        if (service.Bookings.Any())
-            throw new InvalidOperationException("Kann Service mit bestehenden Buchungen nicht löschen. Deaktivieren Sie ihn stattdessen.");
+        // Use a transaction to ensure all operations succeed or fail together
+        using var transaction = await _context.Database.BeginTransactionAsync();
+        try
+        {
+            // Log how many items will be deleted
+            int bookingsCount = service.Bookings?.Count ?? 0;
+            int serviceEmployeesCount = service.ServiceEmployees?.Count ?? 0;
 
-        _context.Services.Remove(service);
-        await _context.SaveChangesAsync();
+            _logger.LogWarning("Deleting service {ServiceName} with {BookingsCount} bookings and {EmployeeCount} employee associations",
+                service.Name, bookingsCount, serviceEmployeesCount);
 
-        _logger.LogInformation("Deleted service: {ServiceName}", service.Name);
-        return true;
+            // 1. First delete all bookings that use this service
+            if (service.Bookings != null && service.Bookings.Any())
+            {
+                _context.Bookings.RemoveRange(service.Bookings);
+            }
+
+            // 2. Delete ServiceEmployees entries (though cascade delete would handle this, 
+            // but explicit is clearer)
+            if (service.ServiceEmployees != null && service.ServiceEmployees.Any())
+            {
+                _context.ServiceEmployees.RemoveRange(service.ServiceEmployees);
+            }
+
+            // 3. Delete any other related records if needed
+            // For example, if you have EmailLogs related to these bookings, you might want to delete them too
+            var bookingIds = service.Bookings?.Select(b => b.Id).ToList();
+            if (bookingIds != null && bookingIds.Any())
+            {
+                // Delete email logs for these bookings
+                var emailLogs = await _context.EmailLogs
+                    .Where(e => bookingIds.Contains(e.BookingId ?? Guid.Empty))
+                    .ToListAsync();
+
+                if (emailLogs.Any())
+                {
+                    _context.EmailLogs.RemoveRange(emailLogs);
+                }
+            }
+
+            // 4. Finally delete the service
+            _context.Services.Remove(service);
+
+            // Save all changes
+            await _context.SaveChangesAsync();
+
+            // Commit the transaction
+            await transaction.CommitAsync();
+
+            _logger.LogInformation("Successfully deleted service: {ServiceName} with all related records (Bookings: {BookingsCount}, Employee associations: {EmployeeCount})",
+                service.Name, bookingsCount, serviceEmployeesCount);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            await transaction.RollbackAsync();
+            _logger.LogError(ex, "Error deleting service {ServiceId}", id);
+            throw new InvalidOperationException($"Fehler beim Löschen des Services: {ex.Message}", ex);
+        }
     }
 
     public async Task<bool> ToggleServiceActiveAsync(Guid id)
