@@ -1,4 +1,3 @@
-// Update BarberDario.Api.Services/EmailService.cs
 using BarberDario.Api.Data;
 using BarberDario.Api.Data.Entities;
 using BarberDario.Api.Options;
@@ -76,6 +75,12 @@ public class EmailService
             booking.ConfirmationSentAt = DateTime.UtcNow;
 
             _logger.LogInformation("Confirmation email sent to {Email}", booking.Customer.Email);
+
+            await SendInternalNotificationAsync(
+                $"Neue Buchung: {booking.Customer.FullName} – {booking.Service.Name} am {booking.BookingDate:dd.MM.yyyy}",
+                GetInternalBookingNotificationHtml(booking, booking.Customer, booking.Service),
+                GetInternalBookingNotificationText(booking, booking.Customer, booking.Service)
+            );
         }
         catch (Exception ex)
         {
@@ -128,6 +133,12 @@ public class EmailService
             emailLog.SentAt = DateTime.UtcNow;
 
             _logger.LogInformation("Confirmation receipt sent to {Email}", customer.Email);
+
+            await SendInternalNotificationAsync(
+                $"Buchung bestätigt: {customer.FullName} – {service.Name} am {booking.BookingDate:dd.MM.yyyy}",
+                GetInternalBookingNotificationHtml(booking, customer, service),
+                GetInternalBookingNotificationText(booking, customer, service)
+            );
         }
         catch (Exception ex)
         {
@@ -178,6 +189,12 @@ public class EmailService
             emailLog.SentAt = DateTime.UtcNow;
 
             _logger.LogInformation("Cancellation confirmation sent to {Email}", customer.Email);
+
+            await SendInternalNotificationAsync(
+                $"Stornierung: {customer.FullName} – {service.Name} am {booking.BookingDate:dd.MM.yyyy}",
+                GetInternalCancellationNotificationHtml(booking, customer, service),
+                GetInternalCancellationNotificationText(booking, customer, service)
+            );
         }
         catch (Exception ex)
         {
@@ -251,6 +268,221 @@ public class EmailService
         _context.EmailLogs.Add(emailLog);
         await _context.SaveChangesAsync();
     }
+
+    #region Internal Notifications
+
+    private async Task SendInternalNotificationAsync(string subject, string htmlBody, string textBody)
+    {
+        try
+        {
+            var message = new MimeMessage();
+            message.From.Add(new MailboxAddress("Skinbloom Buchungssystem", _emailOptions.SenderEmail));
+            message.To.Add(new MailboxAddress("Skinbloom Aesthetics", "info@skinbloom-aesthetics.ch"));
+            message.Subject = $"[Buchungssystem] {subject}";
+
+            var builder = new BodyBuilder
+            {
+                HtmlBody = htmlBody,
+                TextBody = textBody
+            };
+            message.Body = builder.ToMessageBody();
+
+            using var smtp = new SmtpClient();
+            await smtp.ConnectAsync(_emailOptions.SmtpServer, _emailOptions.SmtpPort, SecureSocketOptions.StartTls);
+            await smtp.AuthenticateAsync(_emailOptions.SmtpUsername, _emailOptions.SmtpPassword);
+            await smtp.SendAsync(message);
+            await smtp.DisconnectAsync(true);
+
+            _logger.LogInformation("Internal notification sent: {Subject}", subject);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to send internal notification: {Subject}", subject);
+        }
+    }
+
+    private string GetInternalBookingNotificationHtml(Booking booking, Customer customer, Service service)
+    {
+        return $@"<!DOCTYPE html>
+<html lang='de'>
+<head>
+    <meta charset='UTF-8'>
+    <title>Neue Buchung</title>
+</head>
+<body style='font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px; margin: 0;'>
+    <div style='max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.1);'>
+        <div style='background: linear-gradient(135deg, #1a1a1a 0%, #2d2824 50%, #1a1a1a 100%); padding: 30px; text-align: center; border-bottom: 3px solid #C09995;'>
+            <p style='color: #C09995; font-size: 32px; margin: 0 0 10px 0;'>✧</p>
+            <h1 style='color: #ffffff; font-size: 20px; margin: 0 0 6px 0;'>Neue Buchung eingegangen</h1>
+            <p style='color: #C09995; font-size: 13px; margin: 0; letter-spacing: 1px; text-transform: uppercase;'>Skinbloom Buchungssystem</p>
+        </div>
+        <div style='padding: 30px;'>
+            <table style='width: 100%; border-collapse: collapse;'>
+                <tr style='background-color: #f8f9fa;'>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; width: 140px; border: 1px solid #e2e8f0; font-size: 14px;'>Kunde</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px; font-weight: 600;'>{customer.FullName}</td>
+                </tr>
+                <tr>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>E-Mail</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px;'>{customer.Email ?? "–"}</td>
+                </tr>
+                <tr style='background-color: #f8f9fa;'>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Telefon</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px;'>{customer.Phone ?? "–"}</td>
+                </tr>
+                <tr>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Service</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px; font-weight: 600;'>{service.Name}</td>
+                </tr>
+                <tr style='background-color: #f8f9fa;'>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Datum</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px; font-weight: 600;'>{booking.BookingDate:dd.MM.yyyy}</td>
+                </tr>
+                <tr>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Uhrzeit</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px; font-weight: 600;'>{booking.StartTime:HH:mm} – {booking.EndTime:HH:mm} Uhr</td>
+                </tr>
+                <tr style='background-color: #f8f9fa;'>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Dauer</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px;'>{service.DurationMinutes} Minuten</td>
+                </tr>
+                <tr>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Preis</td>
+                    <td style='padding: 12px 15px; color: #C09995; border: 1px solid #e2e8f0; font-size: 16px; font-weight: 700;'>{service.Price:0.00} CHF</td>
+                </tr>
+                <tr style='background-color: #f8f9fa;'>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Status</td>
+                    <td style='padding: 12px 15px; border: 1px solid #e2e8f0;'><span style='background-color: #d4edda; color: #155724; padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: 600;'>Bestätigt</span></td>
+                </tr>
+                {(!string.IsNullOrEmpty(booking.CustomerNotes) ? $@"
+                <tr>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Notizen</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px;'>{booking.CustomerNotes}</td>
+                </tr>" : "")}
+            </table>
+            <p style='color: #64748b; font-size: 12px; margin-top: 20px; text-align: center;'>
+                Diese Nachricht wurde automatisch vom Skinbloom Buchungssystem generiert.
+            </p>
+        </div>
+        <div style='background: linear-gradient(135deg, #1a1a1a 0%, #2d2824 100%); padding: 20px; text-align: center; border-top: 3px solid #C09995;'>
+            <p style='color: #C09995; font-size: 18px; margin: 0 0 8px 0;'>✧</p>
+            <p style='color: #ffffff; font-size: 13px; font-weight: 700; margin: 0 0 4px 0;'>Skinbloom Aesthetics</p>
+            <p style='color: #a3a3a3; font-size: 12px; margin: 0;'>Elisabethenstrasse 41 · 4051 Basel · info@skinbloom-aesthetics.ch</p>
+        </div>
+    </div>
+</body>
+</html>";
+    }
+
+    private string GetInternalBookingNotificationText(Booking booking, Customer customer, Service service)
+    {
+        return $@"
+SKINBLOOM BUCHUNGSSYSTEM – NEUE BUCHUNG
+------------------------------------------------
+Kunde:    {customer.FullName}
+E-Mail:   {customer.Email ?? "–"}
+Telefon:  {customer.Phone ?? "–"}
+
+Service:  {service.Name}
+Datum:    {booking.BookingDate:dd.MM.yyyy}
+Uhrzeit:  {booking.StartTime:HH:mm} – {booking.EndTime:HH:mm} Uhr
+Dauer:    {service.DurationMinutes} Minuten
+Preis:    {service.Price:0.00} CHF
+Status:   Bestätigt
+{(!string.IsNullOrEmpty(booking.CustomerNotes) ? $"\nNotizen:  {booking.CustomerNotes}" : "")}
+------------------------------------------------
+Diese Nachricht wurde automatisch generiert.";
+    }
+
+    private string GetInternalCancellationNotificationHtml(Booking booking, Customer customer, Service service)
+    {
+        return $@"<!DOCTYPE html>
+<html lang='de'>
+<head>
+    <meta charset='UTF-8'>
+    <title>Stornierung</title>
+</head>
+<body style='font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px; margin: 0;'>
+    <div style='max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.1);'>
+        <div style='background: linear-gradient(135deg, #1a1a1a 0%, #2d2824 50%, #1a1a1a 100%); padding: 30px; text-align: center; border-bottom: 3px solid #C09995;'>
+            <p style='color: #C09995; font-size: 32px; margin: 0 0 10px 0;'>✧</p>
+            <h1 style='color: #ffffff; font-size: 20px; margin: 0 0 6px 0;'>Buchung storniert</h1>
+            <p style='color: #C09995; font-size: 13px; margin: 0; letter-spacing: 1px; text-transform: uppercase;'>Skinbloom Buchungssystem</p>
+        </div>
+        <div style='padding: 30px;'>
+            <table style='width: 100%; border-collapse: collapse;'>
+                <tr style='background-color: #f8f9fa;'>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; width: 140px; border: 1px solid #e2e8f0; font-size: 14px;'>Kunde</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px; font-weight: 600;'>{customer.FullName}</td>
+                </tr>
+                <tr>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>E-Mail</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px;'>{customer.Email ?? "–"}</td>
+                </tr>
+                <tr style='background-color: #f8f9fa;'>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Telefon</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px;'>{customer.Phone ?? "–"}</td>
+                </tr>
+                <tr>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Service</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px; font-weight: 600;'>{service.Name}</td>
+                </tr>
+                <tr style='background-color: #f8f9fa;'>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Datum</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px; font-weight: 600;'>{booking.BookingDate:dd.MM.yyyy}</td>
+                </tr>
+                <tr>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Uhrzeit</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px;'>{booking.StartTime:HH:mm} Uhr</td>
+                </tr>
+                <tr style='background-color: #f8f9fa;'>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Storniert am</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px;'>{DateTime.UtcNow:dd.MM.yyyy HH:mm} Uhr</td>
+                </tr>
+                <tr>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Status</td>
+                    <td style='padding: 12px 15px; border: 1px solid #e2e8f0;'><span style='background-color: #fff3cd; color: #856404; padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: 600;'>Storniert</span></td>
+                </tr>
+                {(!string.IsNullOrEmpty(booking.CancellationReason) ? $@"
+                <tr style='background-color: #f8f9fa;'>
+                    <td style='padding: 12px 15px; font-weight: bold; color: #64748b; border: 1px solid #e2e8f0; font-size: 14px;'>Grund</td>
+                    <td style='padding: 12px 15px; color: #1e293b; border: 1px solid #e2e8f0; font-size: 14px;'>{booking.CancellationReason}</td>
+                </tr>" : "")}
+            </table>
+            <p style='color: #64748b; font-size: 12px; margin-top: 20px; text-align: center;'>
+                Diese Nachricht wurde automatisch vom Skinbloom Buchungssystem generiert.
+            </p>
+        </div>
+        <div style='background: linear-gradient(135deg, #1a1a1a 0%, #2d2824 100%); padding: 20px; text-align: center; border-top: 3px solid #C09995;'>
+            <p style='color: #C09995; font-size: 18px; margin: 0 0 8px 0;'>✧</p>
+            <p style='color: #ffffff; font-size: 13px; font-weight: 700; margin: 0 0 4px 0;'>Skinbloom Aesthetics</p>
+            <p style='color: #a3a3a3; font-size: 12px; margin: 0;'>Elisabethenstrasse 41 · 4051 Basel · info@skinbloom-aesthetics.ch</p>
+        </div>
+    </div>
+</body>
+</html>";
+    }
+
+    private string GetInternalCancellationNotificationText(Booking booking, Customer customer, Service service)
+    {
+        return $@"
+SKINBLOOM BUCHUNGSSYSTEM – STORNIERUNG
+------------------------------------------------
+Kunde:        {customer.FullName}
+E-Mail:       {customer.Email ?? "–"}
+Telefon:      {customer.Phone ?? "–"}
+
+Service:      {service.Name}
+Datum:        {booking.BookingDate:dd.MM.yyyy}
+Uhrzeit:      {booking.StartTime:HH:mm} Uhr
+Storniert am: {DateTime.UtcNow:dd.MM.yyyy HH:mm} Uhr
+Status:       Storniert
+{(!string.IsNullOrEmpty(booking.CancellationReason) ? $"\nGrund:        {booking.CancellationReason}" : "")}
+------------------------------------------------
+Diese Nachricht wurde automatisch generiert.";
+    }
+
+    #endregion
 
     #region Email Templates
 
@@ -335,7 +567,6 @@ public class EmailService
             box-shadow: 0 20px 40px rgba(0,0,0,0.1);
         }}
         
-        /* ── HEADER: always dark so white text is readable in both light & dark mode ── */
         .header {{
             background: linear-gradient(135deg, #1a1a1a 0%, #2d2824 50%, #1a1a1a 100%);
             padding: 40px 30px;
@@ -515,7 +746,6 @@ public class EmailService
             box-shadow: none;
         }}
         
-        /* ── FOOTER: always dark to match header ── */
         .footer {{
             background: linear-gradient(135deg, #1a1a1a 0%, #2d2824 100%);
             padding: 30px;
@@ -669,7 +899,6 @@ public class EmailService
                 </div>
             </div>
             
-            
             <div class='cancel-section'>
                 <div class='cancel-title'>Termin stornieren?</div>
                 <div class='cancel-text'>
@@ -723,7 +952,6 @@ public class EmailService
                     <span class='detail-value'><span class='price'>{service.Price:0.00} CHF</span></span>
                 </div>
             </div>
-            
             
             <div class='cancel-section'>
                 <div class='cancel-title'>Termin verwalten</div>
@@ -1020,7 +1248,6 @@ Tel: +41 61 123 45 67";
         }
         catch
         {
-            // Invalid token
         }
 
         return (Guid.Empty, string.Empty);
