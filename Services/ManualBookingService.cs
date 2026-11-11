@@ -1,6 +1,7 @@
 ﻿using BarberDario.Api.Data;
 using BarberDario.Api.Data.Entities;
 using BarberDario.Api.DTOs;
+using Hangfire;
 using Microsoft.EntityFrameworkCore;
 
 namespace BarberDario.Api.Services;
@@ -9,16 +10,16 @@ public class ManualBookingService
 {
     private readonly SkinbloomDbContext _context;
     private readonly ILogger<ManualBookingService> _logger;
-    private readonly EmailService _emailService;
+    private readonly IBackgroundJobClient _backgroundJobs;
 
     public ManualBookingService(
         SkinbloomDbContext context,
         ILogger<ManualBookingService> logger,
-        EmailService emailService)
+        IBackgroundJobClient backgroundJobs)
     {
         _context = context;
         _logger = logger;
-        _emailService = emailService;
+        _backgroundJobs = backgroundJobs;
     }
 
     public async Task<ManualBookingResponseDto> CreateManualBookingAsync(CreateManualBookingDto dto)
@@ -96,31 +97,18 @@ public class ManualBookingService
             customer.EmployeeId
         );
 
-        // Try to send confirmation email if email is provided
+        // Queue confirmation email if email is provided (sent by Hangfire, retried automatically on failure)
         bool emailSent = false;
         if (!string.IsNullOrEmpty(customer.Email))
         {
             try
             {
-                await _emailService.SendBookingConfirmationAsync(booking.Id);
+                _backgroundJobs.Enqueue<EmailService>(s => s.SendBookingConfirmationAsync(booking.Id));
                 emailSent = true;
-
-                _context.EmailLogs.Add(new EmailLog
-                {
-                    Id = Guid.NewGuid(),
-                    BookingId = booking.Id,
-                    RecipientEmail = customer.Email,
-                    EmailType = EmailType.Confirmation,
-                    SentAt = DateTime.UtcNow,
-                    Status = EmailStatus.Sent
-                });
-                await _context.SaveChangesAsync();
-
-                _logger.LogInformation("Confirmation email sent to {Email}", customer.Email);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Could not send confirmation email to {Email}", customer.Email);
+                _logger.LogError(ex, "Could not queue confirmation email for booking {BookingId}", booking.Id);
             }
         }
 

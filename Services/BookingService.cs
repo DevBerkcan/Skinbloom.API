@@ -1,7 +1,9 @@
 using BarberDario.Api.Data;
 using BarberDario.Api.Data.Entities;
 using BarberDario.Api.DTOs;
+using Hangfire;
 using Microsoft.EntityFrameworkCore;
+using System.Linq.Expressions;
 
 namespace BarberDario.Api.Services;
 
@@ -9,16 +11,31 @@ public class BookingService
 {
     private readonly SkinbloomDbContext _context;
     private readonly ILogger<BookingService> _logger;
-    private readonly EmailService _emailService;
+    private readonly IBackgroundJobClient _backgroundJobs;
 
     public BookingService(
         SkinbloomDbContext context,
         ILogger<BookingService> logger,
-        EmailService emailService)
+        IBackgroundJobClient backgroundJobs)
     {
         _context = context;
         _logger = logger;
-        _emailService = emailService;
+        _backgroundJobs = backgroundJobs;
+    }
+
+    /// <summary>Queues an email job; returns false (and logs) if it could not be queued.</summary>
+    private bool EnqueueEmail(Expression<Func<EmailService, Task>> job, string kind, Guid bookingId)
+    {
+        try
+        {
+            _backgroundJobs.Enqueue(job);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Could not queue {Kind} email for booking {BookingId}", kind, bookingId);
+            return false;
+        }
     }
 
     // ── CREATE ────────────────────────────────────────────────────
@@ -124,42 +141,10 @@ public class BookingService
             "Booking created: {BookingId} for customer {Email} on {Date} at {Time}, employee: {EmployeeId}",
             booking.Id, customer.Email, bookingDate, startTime, employee?.Id);
 
-        // 9. Send confirmation email
+        // 9. Queue confirmation email (sent by Hangfire, retried automatically on failure)
         if (!string.IsNullOrEmpty(customer.Email))
         {
-            try
-            {
-                await _emailService.SendBookingConfirmationAsync(booking.Id);
-                booking.ConfirmationSentAt = DateTime.UtcNow;
-
-                _context.EmailLogs.Add(new EmailLog
-                {
-                    Id = Guid.NewGuid(),
-                    BookingId = booking.Id,
-                    RecipientEmail = customer.Email,
-                    EmailType = EmailType.Confirmation,
-                    SentAt = DateTime.UtcNow,
-                    Status = EmailStatus.Sent,
-                });
-                await _context.SaveChangesAsync();
-                _logger.LogInformation("Confirmation email sent to {Email}", customer.Email);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to send confirmation email to {Email}", customer.Email);
-
-                _context.EmailLogs.Add(new EmailLog
-                {
-                    Id = Guid.NewGuid(),
-                    BookingId = booking.Id,
-                    RecipientEmail = customer.Email,
-                    EmailType = EmailType.Confirmation,
-                    SentAt = null,
-                    Status = EmailStatus.Failed,
-                    ErrorMessage = ex.Message,
-                });
-                await _context.SaveChangesAsync();
-            }
+            EnqueueEmail(s => s.SendBookingConfirmationAsync(booking.Id), "confirmation", booking.Id);
         }
 
         return ToDto(booking, customer, service, employee);
@@ -245,42 +230,10 @@ public class BookingService
             "Booking cancelled: {BookingId}, Reason: {Reason}", booking.Id, dto.Reason);
 
         bool emailSent = false;
-        if (dto.NotifyCustomer)
+        if (dto.NotifyCustomer && !string.IsNullOrEmpty(booking.Customer.Email))
         {
-            try
-            {
-                await _emailService.SendCancellationConfirmationAsync(
-                    booking, booking.Customer, booking.Service);
-
-                _context.EmailLogs.Add(new EmailLog
-                {
-                    BookingId = booking.Id,
-                    RecipientEmail = booking.Customer.Email,
-                    EmailType = EmailType.Cancellation,
-                    SentAt = DateTime.UtcNow,
-                    Status = EmailStatus.Sent,
-                });
-                await _context.SaveChangesAsync();
-                emailSent = true;
-
-                _logger.LogInformation("Cancellation email sent to {Email}", booking.Customer.Email);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex,
-                    "Failed to send cancellation email to {Email}", booking.Customer.Email);
-
-                _context.EmailLogs.Add(new EmailLog
-                {
-                    BookingId = booking.Id,
-                    RecipientEmail = booking.Customer.Email,
-                    EmailType = EmailType.Cancellation,
-                    SentAt = DateTime.UtcNow,
-                    Status = EmailStatus.Failed,
-                    ErrorMessage = ex.Message,
-                });
-                await _context.SaveChangesAsync();
-            }
+            emailSent = EnqueueEmail(
+                s => s.SendCancellationConfirmationAsync(booking.Id), "cancellation", booking.Id);
         }
 
         return new CancelBookingResponseDto(true, "Termin erfolgreich storniert", emailSent);
@@ -320,41 +273,8 @@ public class BookingService
             "Booking confirmed: {BookingId} for customer {Email}",
             booking.Id, booking.Customer.Email);
 
-        bool emailSent = false;
-        try
-        {
-            await _emailService.SendConfirmationReceiptAsync(
-                booking, booking.Customer, booking.Service);
-
-            _context.EmailLogs.Add(new EmailLog
-            {
-                BookingId = booking.Id,
-                RecipientEmail = booking.Customer.Email,
-                EmailType = EmailType.Confirmation,
-                SentAt = DateTime.UtcNow,
-                Status = EmailStatus.Sent,
-            });
-            await _context.SaveChangesAsync();
-            emailSent = true;
-
-            _logger.LogInformation("Confirmation receipt sent to {Email}", booking.Customer.Email);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex,
-                "Failed to send confirmation receipt to {Email}", booking.Customer.Email);
-
-            _context.EmailLogs.Add(new EmailLog
-            {
-                BookingId = booking.Id,
-                RecipientEmail = booking.Customer.Email,
-                EmailType = EmailType.Confirmation,
-                SentAt = DateTime.UtcNow,
-                Status = EmailStatus.Failed,
-                ErrorMessage = ex.Message,
-            });
-            await _context.SaveChangesAsync();
-        }
+        bool emailSent = !string.IsNullOrEmpty(booking.Customer.Email)
+            && EnqueueEmail(s => s.SendConfirmationReceiptAsync(booking.Id), "confirmation receipt", booking.Id);
 
         return ToDto(booking, emailSent);
     }

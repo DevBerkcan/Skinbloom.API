@@ -1,6 +1,7 @@
 using BarberDario.Api.Data;
 using BarberDario.Api.Data.Entities;
 using BarberDario.Api.Options;
+using Hangfire;
 using MailKit.Net.Smtp;
 using MailKit.Security;
 using Microsoft.EntityFrameworkCore;
@@ -9,8 +10,16 @@ using MimeKit;
 
 namespace BarberDario.Api.Services;
 
+/// <summary>
+/// Sends customer emails. The public Send*Async methods are meant to run as Hangfire jobs
+/// (enqueue them via IBackgroundJobClient): every attempt is written to EmailLogs, and on
+/// failure the exception is rethrown so Hangfire retries the job automatically.
+/// </summary>
 public class EmailService
 {
+    /// <summary>Retry attempts for customer emails (Hangfire backoff: roughly 30 s up to ~25 min, ~45 min in total).</summary>
+    public const int RetryAttempts = 6;
+
     private readonly EmailOptions _emailOptions;
     private readonly SkinbloomDbContext _context;
     private readonly ILogger<EmailService> _logger;
@@ -25,249 +34,169 @@ public class EmailService
         _logger = logger;
     }
 
+    [AutomaticRetry(Attempts = RetryAttempts)]
     public async Task SendBookingConfirmationAsync(Guid bookingId)
     {
-        var booking = await _context.Bookings
-            .Include(b => b.Customer)
-            .Include(b => b.Service)
-            .FirstOrDefaultAsync(b => b.Id == bookingId);
-
-        if (booking == null)
+        var booking = await LoadBookingAsync(bookingId);
+        if (booking == null || booking.Status == BookingStatus.Cancelled || string.IsNullOrWhiteSpace(booking.Customer.Email))
         {
-            throw new ArgumentException("Booking not found");
+            _logger.LogWarning("Skipping confirmation email for booking {BookingId} (not found, cancelled or no email)", bookingId);
+            return;
         }
 
-        var emailLog = new EmailLog
-        {
-            BookingId = bookingId,
-            EmailType = EmailType.Confirmation,
-            RecipientEmail = booking.Customer.Email,
-            Subject = $"Ihre Buchungsbestätigung - Skinbloom Aesthetics",
-            Status = EmailStatus.Pending,
-            CreatedAt = DateTime.UtcNow
-        };
+        var cancellationUrl = BuildCancellationUrl(bookingId);
+        var subject = "Ihre Buchungsbestätigung - Skinbloom Aesthetics";
 
-        try
-        {
-            var message = new MimeMessage();
-            message.From.Add(new MailboxAddress("Skinbloom Aesthetics", _emailOptions.SenderEmail));
-            message.To.Add(new MailboxAddress(booking.Customer.FullName, booking.Customer.Email));
-            message.Subject = emailLog.Subject;
+        await SendCustomerEmailAsync(
+            booking, EmailType.Confirmation, subject,
+            GetConfirmationEmailHtml(booking, cancellationUrl),
+            GetConfirmationEmailText(booking, cancellationUrl),
+            onSent: () => booking.ConfirmationSentAt = DateTime.UtcNow);
 
-            var builder = new BodyBuilder();
-            var cancellationToken = GenerateCancellationToken(bookingId);
-            var cancellationUrl = $"{_emailOptions.BaseUrl}/api/bookings/cancel/{cancellationToken}";
-
-            builder.HtmlBody = GetConfirmationEmailHtml(booking, cancellationUrl);
-            builder.TextBody = GetConfirmationEmailText(booking, cancellationUrl);
-
-            message.Body = builder.ToMessageBody();
-
-            using var smtp = new SmtpClient();
-            await smtp.ConnectAsync(_emailOptions.SmtpServer, _emailOptions.SmtpPort,
-                SecureSocketOptions.StartTls);
-            await smtp.AuthenticateAsync(_emailOptions.SmtpUsername, _emailOptions.SmtpPassword);
-            await smtp.SendAsync(message);
-            await smtp.DisconnectAsync(true);
-
-            emailLog.Status = EmailStatus.Sent;
-            emailLog.SentAt = DateTime.UtcNow;
-            booking.ConfirmationSentAt = DateTime.UtcNow;
-
-            _logger.LogInformation("Confirmation email sent to {Email}", booking.Customer.Email);
-
-            await SendInternalNotificationAsync(
-                $"Neue Buchung: {booking.Customer.FullName} – {booking.Service.Name} am {booking.BookingDate:dd.MM.yyyy}",
-                GetInternalBookingNotificationHtml(booking, booking.Customer, booking.Service),
-                GetInternalBookingNotificationText(booking, booking.Customer, booking.Service)
-            );
-        }
-        catch (Exception ex)
-        {
-            emailLog.Status = EmailStatus.Failed;
-            emailLog.ErrorMessage = ex.Message;
-            _logger.LogError(ex, "Failed to send confirmation email to {Email}",
-                booking.Customer.Email);
-        }
-
-        _context.EmailLogs.Add(emailLog);
-        await _context.SaveChangesAsync();
+        await SendInternalNotificationAsync(
+            $"Neue Buchung: {booking.Customer.FullName} – {booking.Service.Name} am {booking.BookingDate:dd.MM.yyyy}",
+            GetInternalBookingNotificationHtml(booking, booking.Customer, booking.Service),
+            GetInternalBookingNotificationText(booking, booking.Customer, booking.Service));
     }
 
-    public async Task SendConfirmationReceiptAsync(Booking booking, Customer customer, Service service)
+    [AutomaticRetry(Attempts = RetryAttempts)]
+    public async Task SendConfirmationReceiptAsync(Guid bookingId)
     {
-        var emailLog = new EmailLog
+        var booking = await LoadBookingAsync(bookingId);
+        if (booking == null || booking.Status == BookingStatus.Cancelled || string.IsNullOrWhiteSpace(booking.Customer.Email))
         {
-            BookingId = booking.Id,
-            EmailType = EmailType.Confirmation,
-            RecipientEmail = customer.Email,
-            Subject = $"Buchungsbestätigung: {service.Name} am {booking.BookingDate:dd.MM.yyyy}",
-            Status = EmailStatus.Pending,
-            CreatedAt = DateTime.UtcNow
-        };
-
-        try
-        {
-            var message = new MimeMessage();
-            message.From.Add(new MailboxAddress("Skinbloom Aesthetics", _emailOptions.SenderEmail));
-            message.To.Add(new MailboxAddress(customer.FullName, customer.Email));
-            message.Subject = emailLog.Subject;
-
-            var builder = new BodyBuilder();
-            var cancellationToken = GenerateCancellationToken(booking.Id);
-            var cancellationUrl = $"{_emailOptions.BaseUrl}/api/bookings/cancel/{cancellationToken}";
-
-            builder.HtmlBody = GetConfirmationReceiptHtml(booking, customer, service, cancellationUrl);
-            builder.TextBody = GetConfirmationReceiptText(booking, customer, service, cancellationUrl);
-
-            message.Body = builder.ToMessageBody();
-
-            using var smtp = new SmtpClient();
-            await smtp.ConnectAsync(_emailOptions.SmtpServer, _emailOptions.SmtpPort,
-                SecureSocketOptions.StartTls);
-            await smtp.AuthenticateAsync(_emailOptions.SmtpUsername, _emailOptions.SmtpPassword);
-            await smtp.SendAsync(message);
-            await smtp.DisconnectAsync(true);
-
-            emailLog.Status = EmailStatus.Sent;
-            emailLog.SentAt = DateTime.UtcNow;
-
-            _logger.LogInformation("Confirmation receipt sent to {Email}", customer.Email);
-
-            await SendInternalNotificationAsync(
-                $"Buchung bestätigt: {customer.FullName} – {service.Name} am {booking.BookingDate:dd.MM.yyyy}",
-                GetInternalBookingNotificationHtml(booking, customer, service),
-                GetInternalBookingNotificationText(booking, customer, service)
-            );
-        }
-        catch (Exception ex)
-        {
-            emailLog.Status = EmailStatus.Failed;
-            emailLog.ErrorMessage = ex.Message;
-            _logger.LogError(ex, "Failed to send confirmation receipt to {Email}",
-                customer.Email);
+            _logger.LogWarning("Skipping confirmation receipt for booking {BookingId} (not found, cancelled or no email)", bookingId);
+            return;
         }
 
-        _context.EmailLogs.Add(emailLog);
-        await _context.SaveChangesAsync();
+        var customer = booking.Customer;
+        var service = booking.Service;
+        var cancellationUrl = BuildCancellationUrl(bookingId);
+        var subject = $"Buchungsbestätigung: {service.Name} am {booking.BookingDate:dd.MM.yyyy}";
+
+        await SendCustomerEmailAsync(
+            booking, EmailType.Confirmation, subject,
+            GetConfirmationReceiptHtml(booking, customer, service, cancellationUrl),
+            GetConfirmationReceiptText(booking, customer, service, cancellationUrl),
+            onSent: () => booking.ConfirmationSentAt = DateTime.UtcNow);
+
+        await SendInternalNotificationAsync(
+            $"Buchung bestätigt: {customer.FullName} – {service.Name} am {booking.BookingDate:dd.MM.yyyy}",
+            GetInternalBookingNotificationHtml(booking, customer, service),
+            GetInternalBookingNotificationText(booking, customer, service));
     }
 
-    public async Task SendCancellationConfirmationAsync(Booking booking, Customer customer, Service service)
+    [AutomaticRetry(Attempts = RetryAttempts)]
+    public async Task SendCancellationConfirmationAsync(Guid bookingId)
     {
-        var emailLog = new EmailLog
+        var booking = await LoadBookingAsync(bookingId);
+        if (booking == null || booking.Status != BookingStatus.Cancelled || string.IsNullOrWhiteSpace(booking.Customer.Email))
         {
-            BookingId = booking.Id,
-            EmailType = EmailType.Cancellation,
-            RecipientEmail = customer.Email,
-            Subject = $"Ihre Stornierung - Skinbloom Aesthetics",
-            Status = EmailStatus.Pending,
-            CreatedAt = DateTime.UtcNow
-        };
-
-        try
-        {
-            var message = new MimeMessage();
-            message.From.Add(new MailboxAddress("Skinbloom Aesthetics", _emailOptions.SenderEmail));
-            message.To.Add(new MailboxAddress(customer.FullName, customer.Email));
-            message.Subject = emailLog.Subject;
-
-            var builder = new BodyBuilder();
-
-            builder.HtmlBody = GetCancellationEmailHtml(booking, customer, service);
-            builder.TextBody = GetCancellationEmailText(booking, customer, service);
-
-            message.Body = builder.ToMessageBody();
-
-            using var smtp = new SmtpClient();
-            await smtp.ConnectAsync(_emailOptions.SmtpServer, _emailOptions.SmtpPort,
-                SecureSocketOptions.StartTls);
-            await smtp.AuthenticateAsync(_emailOptions.SmtpUsername, _emailOptions.SmtpPassword);
-            await smtp.SendAsync(message);
-            await smtp.DisconnectAsync(true);
-
-            emailLog.Status = EmailStatus.Sent;
-            emailLog.SentAt = DateTime.UtcNow;
-
-            _logger.LogInformation("Cancellation confirmation sent to {Email}", customer.Email);
-
-            await SendInternalNotificationAsync(
-                $"Stornierung: {customer.FullName} – {service.Name} am {booking.BookingDate:dd.MM.yyyy}",
-                GetInternalCancellationNotificationHtml(booking, customer, service),
-                GetInternalCancellationNotificationText(booking, customer, service)
-            );
-        }
-        catch (Exception ex)
-        {
-            emailLog.Status = EmailStatus.Failed;
-            emailLog.ErrorMessage = ex.Message;
-            _logger.LogError(ex, "Failed to send cancellation confirmation to {Email}",
-                customer.Email);
+            _logger.LogWarning("Skipping cancellation email for booking {BookingId} (not found, not cancelled or no email)", bookingId);
+            return;
         }
 
-        _context.EmailLogs.Add(emailLog);
-        await _context.SaveChangesAsync();
+        var customer = booking.Customer;
+        var service = booking.Service;
+
+        await SendCustomerEmailAsync(
+            booking, EmailType.Cancellation, "Ihre Stornierung - Skinbloom Aesthetics",
+            GetCancellationEmailHtml(booking, customer, service),
+            GetCancellationEmailText(booking, customer, service));
+
+        await SendInternalNotificationAsync(
+            $"Stornierung: {customer.FullName} – {service.Name} am {booking.BookingDate:dd.MM.yyyy}",
+            GetInternalCancellationNotificationHtml(booking, customer, service),
+            GetInternalCancellationNotificationText(booking, customer, service));
     }
 
+    [AutomaticRetry(Attempts = RetryAttempts)]
     public async Task SendBookingReminderAsync(Guid bookingId)
     {
-        var booking = await _context.Bookings
+        var booking = await LoadBookingAsync(bookingId);
+        if (booking == null || booking.Status != BookingStatus.Confirmed || booking.ReminderSentAt.HasValue
+            || string.IsNullOrWhiteSpace(booking.Customer.Email))
+        {
+            _logger.LogInformation("Skipping reminder for booking {BookingId} (not found, not confirmed, already sent or no email)", bookingId);
+            return;
+        }
+
+        var cancellationUrl = BuildCancellationUrl(bookingId);
+
+        await SendCustomerEmailAsync(
+            booking, EmailType.Reminder, $"Erinnerung: Termin am {booking.BookingDate:dd.MM.yyyy}",
+            GetReminderEmailHtml(booking, cancellationUrl),
+            GetReminderEmailText(booking, cancellationUrl),
+            onSent: () => booking.ReminderSentAt = DateTime.UtcNow);
+    }
+
+    #region Sending helpers
+
+    private Task<Booking?> LoadBookingAsync(Guid bookingId) =>
+        _context.Bookings
             .Include(b => b.Customer)
             .Include(b => b.Service)
             .FirstOrDefaultAsync(b => b.Id == bookingId);
 
-        if (booking == null || booking.Status != BookingStatus.Confirmed)
-            return;
+    private string BuildCancellationUrl(Guid bookingId) =>
+        $"{_emailOptions.BaseUrl}/api/bookings/cancel/{GenerateCancellationToken(bookingId)}";
 
+    /// <summary>
+    /// Sends one email to the booking's customer and writes exactly one EmailLog entry for this attempt.
+    /// Rethrows on failure so the calling Hangfire job is retried.
+    /// </summary>
+    private async Task SendCustomerEmailAsync(
+        Booking booking, EmailType type, string subject, string htmlBody, string textBody, Action? onSent = null)
+    {
+        var customer = booking.Customer;
         var emailLog = new EmailLog
         {
-            BookingId = bookingId,
-            EmailType = EmailType.Reminder,
-            RecipientEmail = booking.Customer.Email,
-            Subject = $"Erinnerung: Termin am {booking.BookingDate:dd.MM.yyyy}",
+            BookingId = booking.Id,
+            EmailType = type,
+            RecipientEmail = customer.Email ?? string.Empty,
+            Subject = subject,
             Status = EmailStatus.Pending,
             CreatedAt = DateTime.UtcNow
         };
+        _context.EmailLogs.Add(emailLog);
 
         try
         {
             var message = new MimeMessage();
-            message.From.Add(new MailboxAddress("Skinbloom Aesthetics", _emailOptions.SenderEmail));
-            message.To.Add(new MailboxAddress(booking.Customer.FullName, booking.Customer.Email));
-            message.Subject = emailLog.Subject;
+            message.From.Add(new MailboxAddress(_emailOptions.SenderName, _emailOptions.SenderEmail));
+            message.To.Add(new MailboxAddress(customer.FullName, customer.Email));
+            message.Subject = subject;
+            message.Body = new BodyBuilder { HtmlBody = htmlBody, TextBody = textBody }.ToMessageBody();
 
-            var builder = new BodyBuilder();
-            var cancellationToken = GenerateCancellationToken(bookingId);
-            var cancellationUrl = $"{_emailOptions.BaseUrl}/api/bookings/cancel/{cancellationToken}";
-
-            builder.HtmlBody = GetReminderEmailHtml(booking, cancellationUrl);
-            builder.TextBody = GetReminderEmailText(booking, cancellationUrl);
-
-            message.Body = builder.ToMessageBody();
-
-            using var smtp = new SmtpClient();
-            await smtp.ConnectAsync(_emailOptions.SmtpServer, _emailOptions.SmtpPort,
-                SecureSocketOptions.StartTls);
-            await smtp.AuthenticateAsync(_emailOptions.SmtpUsername, _emailOptions.SmtpPassword);
-            await smtp.SendAsync(message);
-            await smtp.DisconnectAsync(true);
+            await SendViaSmtpAsync(message);
 
             emailLog.Status = EmailStatus.Sent;
             emailLog.SentAt = DateTime.UtcNow;
-            booking.ReminderSentAt = DateTime.UtcNow;
-
-            _logger.LogInformation("Reminder email sent to {Email}", booking.Customer.Email);
+            onSent?.Invoke();
+            _logger.LogInformation("{Type} email sent to {Email} for booking {BookingId}", type, customer.Email, booking.Id);
         }
         catch (Exception ex)
         {
             emailLog.Status = EmailStatus.Failed;
             emailLog.ErrorMessage = ex.Message;
-            _logger.LogError(ex, "Failed to send reminder email to {Email}",
-                booking.Customer.Email);
+            _logger.LogError(ex, "Failed to send {Type} email to {Email} for booking {BookingId}", type, customer.Email, booking.Id);
+            await _context.SaveChangesAsync();
+            throw;
         }
 
-        _context.EmailLogs.Add(emailLog);
         await _context.SaveChangesAsync();
     }
+
+    private async Task SendViaSmtpAsync(MimeMessage message)
+    {
+        using var smtp = new SmtpClient { Timeout = 30_000 };
+        await smtp.ConnectAsync(_emailOptions.SmtpServer, _emailOptions.SmtpPort, SecureSocketOptions.StartTls);
+        await smtp.AuthenticateAsync(_emailOptions.SmtpUsername, _emailOptions.SmtpPassword);
+        await smtp.SendAsync(message);
+        await smtp.DisconnectAsync(true);
+    }
+
+    #endregion
 
     #region Internal Notifications
 
@@ -279,24 +208,15 @@ public class EmailService
             message.From.Add(new MailboxAddress("Skinbloom Buchungssystem", _emailOptions.SenderEmail));
             message.To.Add(new MailboxAddress("Skinbloom Aesthetics", "info@skinbloom-aesthetics.ch"));
             message.Subject = $"[Buchungssystem] {subject}";
+            message.Body = new BodyBuilder { HtmlBody = htmlBody, TextBody = textBody }.ToMessageBody();
 
-            var builder = new BodyBuilder
-            {
-                HtmlBody = htmlBody,
-                TextBody = textBody
-            };
-            message.Body = builder.ToMessageBody();
-
-            using var smtp = new SmtpClient();
-            await smtp.ConnectAsync(_emailOptions.SmtpServer, _emailOptions.SmtpPort, SecureSocketOptions.StartTls);
-            await smtp.AuthenticateAsync(_emailOptions.SmtpUsername, _emailOptions.SmtpPassword);
-            await smtp.SendAsync(message);
-            await smtp.DisconnectAsync(true);
+            await SendViaSmtpAsync(message);
 
             _logger.LogInformation("Internal notification sent: {Subject}", subject);
         }
         catch (Exception ex)
         {
+            // Internal notification must never make the customer email job retry (would resend to the customer).
             _logger.LogError(ex, "Failed to send internal notification: {Subject}", subject);
         }
     }
